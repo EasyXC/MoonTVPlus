@@ -75,7 +75,7 @@ export async function GET() {
       );
     }
 
-    // 获取短剧视频源列表
+    // 获取短剧视频源列表（内部已检查各源分类，含短剧分类的源会带 typeId）
     const sources = await getDuanjuSources();
 
     if (!sources || sources.length === 0) {
@@ -86,60 +86,50 @@ export async function GET() {
       });
     }
 
-    // 取第一个视频源
+    // 取第一个视频源，直接使用 getDuanjuSources() 中已筛选出的短剧分类 ID
     const firstSource = sources[0];
     console.log(`使用视频源: ${firstSource.name}`);
 
-    // 获取该视频源的分类列表，找到短剧分类的ID
-    const classUrl = `${firstSource.api}?ac=list`;
-    const classResponse = await fetch(classUrl, {
-      headers: API_CONFIG.search.headers,
-    });
-
-    if (!classResponse.ok) {
-      throw new Error('获取分类列表失败');
-    }
-
-    const classData: CmsClassResponse = await classResponse.json();
-
-    // 找到短剧分类的ID
-    let duanjuClass: CmsClassItem | null = null;
-    if (classData.class && Array.isArray(classData.class)) {
-      duanjuClass = classData.class.find((item) => {
-        const typeName = item.type_name?.toLowerCase() || '';
-        return (
-          typeName.includes('短剧') ||
-          typeName.includes('短视频') ||
-          typeName.includes('微短剧')
-        );
-      }) || null;
-    }
-
-    if (!duanjuClass) {
+    if (!firstSource.typeId) {
       return NextResponse.json({
         code: 200,
-        message: '未找到短剧分类',
+        message: '该视频源缺少短剧分类 ID',
         data: [],
       });
     }
 
-    const duanjuTypeId = duanjuClass.type_id;
+    const duanjuTypeId = firstSource.typeId;
     console.log(`短剧分类ID: ${duanjuTypeId}`);
 
-    // 短剧分类下的直接子分类；带二级分类的源通常把内容挂在二级分类下，
-    // 一级分类为空时依次尝试子分类，取第一个有内容的
-    const childTypeIds = (classData.class || [])
-      .filter(
-        (item) => (item.type_pid ?? 0).toString() === duanjuTypeId.toString()
-      )
-      .map((item) => item.type_id);
-
     let videoList: ApiSearchItem[] | null = null;
-    for (const typeId of [duanjuClass.type_id, ...childTypeIds]) {
-      const list = await fetchVideoList(firstSource.api, typeId);
-      if (list && list.length > 0) {
-        videoList = list;
-        break;
+    const list = await fetchVideoList(firstSource.api, duanjuTypeId);
+    if (list && list.length > 0) {
+      videoList = list;
+    }
+
+    // 一级分类为空时尝试获取子分类（补充兜底：再发一次 ac=list）
+    if (!videoList || videoList.length === 0) {
+      const classUrl = `${firstSource.api}?ac=list`;
+      const classResponse = await fetch(classUrl, {
+        headers: API_CONFIG.search.headers,
+      });
+
+      if (classResponse.ok) {
+        const classData: CmsClassResponse = await classResponse.json();
+        const childTypeIds = (classData.class || [])
+          .filter(
+            (item) =>
+              (item.type_pid ?? 0).toString() === duanjuTypeId.toString()
+          )
+          .map((item) => item.type_id);
+
+        for (const typeId of childTypeIds) {
+          const childList = await fetchVideoList(firstSource.api, typeId);
+          if (childList && childList.length > 0) {
+            videoList = childList;
+            break;
+          }
+        }
       }
     }
 
