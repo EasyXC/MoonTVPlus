@@ -86,59 +86,73 @@ export async function getDuanjuSources(): Promise<DuanjuSource[]> {
     const allSources = await getAvailableApiSites();
     const duanjuSources: DuanjuSource[] = [];
 
-    // 并发���求所有视频源的分类列表
-    const checkPromises = allSources.map(async (source) => {
-      try {
-        const classUrl = `${source.api}?ac=list`;
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000);
+    // Cloudflare Workers 单请求最多 50 个子请求（含 Upstash Redis 等内部请求），
+    // 这里限制：① 最多检查前 20 个源，② 每批最多并发 5 个，③ 找到 3 个含短剧源即停止
+    const MAX_CHECK_SOURCES = 20;
+    const MAX_CONCURRENT = 5;
+    const MAX_FOUND = 3;
 
-        const response = await fetch(classUrl, {
-          headers: API_CONFIG.search.headers,
-          signal: controller.signal,
-        });
+    const sourcesToCheck = allSources.slice(0, MAX_CHECK_SOURCES);
 
-        clearTimeout(timeoutId);
+    for (let i = 0; i < sourcesToCheck.length; i += MAX_CONCURRENT) {
+      const batch = sourcesToCheck.slice(i, i + MAX_CONCURRENT);
+      const checkPromises = batch.map(async (source) => {
+        try {
+          const classUrl = `${source.api}?ac=list`;
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-        if (!response.ok) {
+          const response = await fetch(classUrl, {
+            headers: API_CONFIG.search.headers,
+            signal: controller.signal,
+          });
+
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            return null;
+          }
+
+          const data: CmsClassResponse = await response.json();
+
+          // 检查是否有短剧分类
+          if (data.class && Array.isArray(data.class)) {
+            const duanjuType = data.class.find((item) =>
+              isDuanjuTypeName(item.type_name || '')
+            );
+
+            if (duanjuType) {
+              return {
+                key: source.key,
+                name: source.name,
+                api: source.api,
+                typeId: duanjuType.type_id.toString(),
+                typeName: duanjuType.type_name,
+              };
+            }
+          }
+
+          return null;
+        } catch (error) {
+          // 请求失败或超时，忽略该源
+          console.error(`检查视频源 ${source.name} 失败:`, error);
           return null;
         }
+      });
 
-        const data: CmsClassResponse = await response.json();
-
-        // 检查是否有短剧分类
-        if (data.class && Array.isArray(data.class)) {
-          const duanjuType = data.class.find((item) =>
-            isDuanjuTypeName(item.type_name || '')
-          );
-
-          if (duanjuType) {
-            return {
-              key: source.key,
-              name: source.name,
-              api: source.api,
-              typeId: duanjuType.type_id.toString(),
-              typeName: duanjuType.type_name,
-            };
-          }
+      const results = await Promise.all(checkPromises);
+      results.forEach((result) => {
+        if (result) {
+          duanjuSources.push(result);
         }
+      });
 
-        return null;
-      } catch (error) {
-        // 请求失败或超时，忽略该源
-        console.error(`检查视频源 ${source.name} 失败:`, error);
-        return null;
+      // 找到足够数量后提前退出，减少子请求消耗
+      if (duanjuSources.length >= MAX_FOUND) {
+        console.log(`已找到 ${duanjuSources.length} 个短剧源，提前停止筛选`);
+        break;
       }
-    });
-
-    const results = await Promise.all(checkPromises);
-
-    // 过滤掉null值
-    results.forEach((result) => {
-      if (result) {
-        duanjuSources.push(result);
-      }
-    });
+    }
 
     console.log(`找到 ${duanjuSources.length} 个包含短剧分类的视频源`);
 
