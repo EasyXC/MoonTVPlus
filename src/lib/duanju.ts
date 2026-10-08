@@ -27,6 +27,35 @@ export function isDuanjuTypeName(typeName: string): boolean {
   );
 }
 
+// 短剧视频源缓存有效期：6 小时
+const DUANJU_SOURCES_CACHE_DURATION = 6 * 60 * 60 * 1000;
+
+// 兼容新旧两种缓存格式：新格式为 { ts, sources }，旧格式为纯数组
+function parseDuanjuSourcesCache(
+  cachedData: string | null
+): { sources: DuanjuSource[]; ts: number } | null {
+  if (cachedData === null) return null;
+  try {
+    const parsed = JSON.parse(cachedData);
+    if (Array.isArray(parsed)) {
+      // 旧版本纯数组缓存：无法确定写入时间，视为无效缓存，强制重建
+      return null;
+    }
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.ts === 'number' &&
+      Array.isArray(parsed.sources)
+    ) {
+      return parsed as { sources: DuanjuSource[]; ts: number };
+    }
+    return null;
+  } catch {
+    // 缓存损坏时视为无效，走重新筛选
+    return null;
+  }
+}
+
 /**
  * 获取包含短剧分类的视频源列表
  */
@@ -34,19 +63,22 @@ export async function getDuanjuSources(): Promise<DuanjuSource[]> {
   try {
     // 先查询数据库中是否有缓存
     const cachedData = await db.getGlobalValue('duanju');
+    const cache = parseDuanjuSourcesCache(cachedData);
 
-    if (cachedData !== null) {
-      // 有缓存，直接返回（getGlobalValue 已经处理了序列化问题）
-      const cachedSources: DuanjuSource[] = cachedData ? JSON.parse(cachedData) : [];
+    if (cache !== null) {
+      const cachedSources = cache.sources;
+      const isExpired = Date.now() - cache.ts > DUANJU_SOURCES_CACHE_DURATION;
       // 旧版本缓存只保存采集源，不包含短剧分类 ID。缺少 typeId 时自动重建缓存。
+      // 空数组缓存仅在有效期内直接返回，超时后重新筛选，避免"空缓存永久锁死"。
       if (
-        cachedSources.length === 0 ||
-        cachedSources.every((source) => source.typeId)
+        !isExpired &&
+        (cachedSources.length === 0 ||
+          cachedSources.every((source) => source.typeId))
       ) {
         return cachedSources;
       }
 
-      console.log('短剧视频源缓存缺少分类信息，重新筛选...');
+      console.log('短剧视频源缓存过期或缺少分类信息，重新筛选...');
     }
 
     // 没有缓存，开始筛选
@@ -110,8 +142,11 @@ export async function getDuanjuSources(): Promise<DuanjuSource[]> {
 
     console.log(`找到 ${duanjuSources.length} 个包含短剧分类的视频源`);
 
-    // 存入数据库（即使是空数组也要存）
-    await db.setGlobalValue('duanju', JSON.stringify(duanjuSources));
+    // 存入数据库（带时间戳；即使空数组也存，超时后会自动重建，避免空缓存永久锁死）
+    await db.setGlobalValue(
+      'duanju',
+      JSON.stringify({ ts: Date.now(), sources: duanjuSources })
+    );
 
     return duanjuSources;
   } catch (error) {
