@@ -156,9 +156,10 @@ export async function GET() {
       let episodes: string[] = [];
       let titles: string[] = [];
 
-      // 使用正则表达式从 vod_play_url 提取 m3u8 链接
+      // 从 vod_play_url 提取播放链接：与列表页 parseEpisodes 保持一致，
+      // 不限制 .m3u8 后缀，避免 mp4/泛解析地址被全部过滤导致首页短剧模块为空
       if (item.vod_play_url) {
-        // 先用 $$$ 分割
+        // 先用 $$$ 分割（多个播放线路）
         const vod_play_url_array = item.vod_play_url.split('$$$');
         // 分集之间#分割，标题和播放链接 $ 分割
         vod_play_url_array.forEach((url: string) => {
@@ -167,14 +168,14 @@ export async function GET() {
           const title_url_array = url.split('#');
           title_url_array.forEach((title_url: string) => {
             const episode_title_url = title_url.split('$');
-            if (
-              episode_title_url.length === 2 &&
-              episode_title_url[1].endsWith('.m3u8')
-            ) {
-              matchTitles.push(episode_title_url[0]);
-              matchEpisodes.push(episode_title_url[1]);
+            const episodeName = episode_title_url[0]?.trim();
+            const episodeUrl = episode_title_url[1]?.trim();
+            if (episodeName && episodeUrl) {
+              matchTitles.push(episodeName);
+              matchEpisodes.push(episodeUrl);
             }
           });
+          // 取集数最多的一条线路作为该视频的播放数据
           if (matchEpisodes.length > episodes.length) {
             episodes = matchEpisodes;
             titles = matchTitles;
@@ -205,11 +206,15 @@ export async function GET() {
 
     console.log(`返回 ${filteredVideos.length} 个短剧视频`);
 
-    // 保存到内存缓存
-    cachedRecommends = {
-      timestamp: Date.now(),
-      data: filteredVideos,
-    };
+    // 保存到内存缓存；空结果不缓存，避免源恢复后仍被 1 小时空缓存顶住
+    if (filteredVideos.length > 0) {
+      cachedRecommends = {
+        timestamp: Date.now(),
+        data: filteredVideos,
+      };
+    } else {
+      cachedRecommends = null;
+    }
 
     const cacheTime = await getCacheTime();
     return NextResponse.json(
