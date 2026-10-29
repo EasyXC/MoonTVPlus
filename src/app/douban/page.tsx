@@ -290,8 +290,41 @@ function DoubanPageClient() {
       setIsLoadingMore(false);
 
       let data: DoubanResult;
+      // 短剧分类：调用短剧 API
+      if (type === 'tv' && secondarySelection === 'tv_short') {
+        try {
+          const response = await fetch('/api/duanju/recommends');
+          const duanjuData = await response.json();
 
-      if (type === 'custom') {
+          if (duanjuData.code === 200 && duanjuData.data) {
+            // 将短剧数据转换为 DoubanResult 格式
+            data = {
+              code: 200,
+              message: 'success',
+              list: duanjuData.data.map((item: any) => ({
+                id: item.id || '',
+                title: item.title || '',
+                poster: item.poster || '',
+                rate: '', // 短剧数据可能没有评分
+                year: item.year || '',
+              })),
+            };
+          } else {
+            data = {
+              code: 200,
+              message: '暂无短剧数据',
+              list: [],
+            };
+          }
+        } catch (error) {
+          console.error('获取短剧数据失败:', error);
+          data = {
+            code: 200,
+            message: '获取短剧数据失败',
+            list: [],
+          };
+        }
+      } else if (type === 'custom') {
         // 自定义分类模式：根据选中的一级和二级选项获取对应的分类
         const selectedCategory = customCategories.find(
           (cat) =>

@@ -2,8 +2,10 @@
 
 import { NextResponse } from 'next/server';
 
-import { API_CONFIG, getCacheTime } from '@/lib/config';
+import { API_CONFIG, getAvailableApiSites, getCacheTime } from '@/lib/config';
 import { getDuanjuSources } from '@/lib/duanju';
+import { searchFromApi } from '@/lib/downstream';
+import { parseJsonLosslessIntegers } from '@/lib/json';
 import { SearchResult } from '@/lib/types';
 import { cleanHtmlTags } from '@/lib/utils';
 
@@ -16,7 +18,7 @@ let cachedRecommends: {
 } | null = null;
 
 interface ApiSearchItem {
-  vod_id: string;
+  vod_id: string | number;
   vod_name: string;
   vod_pic: string;
   vod_remarks?: string;
@@ -44,7 +46,9 @@ const fetchVideoList = async (api: string, typeId: string | number) => {
     headers: API_CONFIG.search.headers,
   });
   if (!response.ok) return null;
-  const data = await response.json();
+  const data = parseJsonLosslessIntegers<{ list?: ApiSearchItem[] }>(
+    await response.text()
+  );
   if (!data?.list || !Array.isArray(data.list)) return null;
   return data.list as ApiSearchItem[];
 };
@@ -75,70 +79,77 @@ export async function GET() {
       );
     }
 
-    // 获取短剧视频源列表（内部已检查各源分类，含短剧分类的源会带 typeId）
+    // 获取短剧视频源列表
     const sources = await getDuanjuSources();
 
+    // 如果没有找到短剧视频源，尝试使用搜索备用方案
     if (!sources || sources.length === 0) {
-      return NextResponse.json({
-        code: 200,
-        message: '暂无短剧视频源',
-        data: [],
-      });
+      console.log('未找到短剧专用视频源，尝试使用搜索备用方案...');
+      return await searchDuanjuFallback();
     }
 
-    // 取第一个视频源，直接使用 getDuanjuSources() 中已筛选出的短剧分类 ID
+    // 取第一个视频源
     const firstSource = sources[0];
     console.log(`使用视频源: ${firstSource.name}`);
 
-    if (!firstSource.typeId) {
-      return NextResponse.json({
-        code: 200,
-        message: '该视频源缺少短剧分类 ID',
-        data: [],
-      });
+    // 获取该视频源的分类列表，找到短剧分类的ID
+    const classUrl = `${firstSource.api}?ac=list`;
+    const classResponse = await fetch(classUrl, {
+      headers: API_CONFIG.search.headers,
+    });
+
+    if (!classResponse.ok) {
+      throw new Error('获取分类列表失败');
     }
 
-    const duanjuTypeId = firstSource.typeId;
+    const classData = parseJsonLosslessIntegers<CmsClassResponse>(
+      await classResponse.text()
+    );
+
+    // 找到短剧分类的ID
+    let duanjuClass: CmsClassItem | null = null;
+    if (classData.class && Array.isArray(classData.class)) {
+      duanjuClass =
+        classData.class.find((item) => {
+          const typeName = item.type_name?.toLowerCase() || '';
+          return (
+            typeName.includes('短剧') ||
+            typeName.includes('短视频') ||
+            typeName.includes('微短剧')
+          );
+        }) || null;
+    }
+
+    // 未找到短剧分类，尝试使用搜索备用方案
+    if (!duanjuClass) {
+      console.log('未找到短剧分类，尝试使用搜索备用方案...');
+      return await searchDuanjuFallback();
+    }
+
+    const duanjuTypeId = duanjuClass.type_id;
     console.log(`短剧分类ID: ${duanjuTypeId}`);
 
+    // 短剧分类下的直接子分类；带二级分类的源通常把内容挂在二级分类下，
+    // 一级分类为空时依次尝试子分类，取第一个有内容的
+    const childTypeIds = (classData.class || [])
+      .filter(
+        (item) => (item.type_pid ?? 0).toString() === duanjuTypeId.toString()
+      )
+      .map((item) => item.type_id);
+
     let videoList: ApiSearchItem[] | null = null;
-    const list = await fetchVideoList(firstSource.api, duanjuTypeId);
-    if (list && list.length > 0) {
-      videoList = list;
-    }
-
-    // 一级分类为空时尝试获取子分类（补充兜底：再发一次 ac=list）
-    if (!videoList || videoList.length === 0) {
-      const classUrl = `${firstSource.api}?ac=list`;
-      const classResponse = await fetch(classUrl, {
-        headers: API_CONFIG.search.headers,
-      });
-
-      if (classResponse.ok) {
-        const classData: CmsClassResponse = await classResponse.json();
-        const childTypeIds = (classData.class || [])
-          .filter(
-            (item) =>
-              (item.type_pid ?? 0).toString() === duanjuTypeId.toString()
-          )
-          .map((item) => item.type_id);
-
-        for (const typeId of childTypeIds) {
-          const childList = await fetchVideoList(firstSource.api, typeId);
-          if (childList && childList.length > 0) {
-            videoList = childList;
-            break;
-          }
-        }
+    for (const typeId of [duanjuClass.type_id, ...childTypeIds]) {
+      const list = await fetchVideoList(firstSource.api, typeId);
+      if (list && list.length > 0) {
+        videoList = list;
+        break;
       }
     }
 
+    // 短剧视频列表为空，尝试使用搜索备用方案
     if (!videoList || videoList.length === 0) {
-      return NextResponse.json({
-        code: 200,
-        message: '暂无短剧视频',
-        data: [],
-      });
+      console.log('短剧视频列表为空，尝试使用搜索备用方案...');
+      return await searchDuanjuFallback();
     }
 
     // 处理视频数据
@@ -146,10 +157,9 @@ export async function GET() {
       let episodes: string[] = [];
       let titles: string[] = [];
 
-      // 从 vod_play_url 提取播放链接：与列表页 parseEpisodes 保持一致，
-      // 不限制 .m3u8 后缀，避免 mp4/泛解析地址被全部过滤导致首页短剧模块为空
+      // 使用正则表达式从 vod_play_url 提取 m3u8 链接
       if (item.vod_play_url) {
-        // 先用 $$$ 分割（多个播放线路）
+        // 先用 $$$ 分割
         const vod_play_url_array = item.vod_play_url.split('$$$');
         // 分集之间#分割，标题和播放链接 $ 分割
         vod_play_url_array.forEach((url: string) => {
@@ -158,14 +168,14 @@ export async function GET() {
           const title_url_array = url.split('#');
           title_url_array.forEach((title_url: string) => {
             const episode_title_url = title_url.split('$');
-            const episodeName = episode_title_url[0]?.trim();
-            const episodeUrl = episode_title_url[1]?.trim();
-            if (episodeName && episodeUrl) {
-              matchTitles.push(episodeName);
-              matchEpisodes.push(episodeUrl);
+            if (
+              episode_title_url.length === 2 &&
+              episode_title_url[1].endsWith('.m3u8')
+            ) {
+              matchTitles.push(episode_title_url[0]);
+              matchEpisodes.push(episode_title_url[1]);
             }
           });
-          // 取集数最多的一条线路作为该视频的播放数据
           if (matchEpisodes.length > episodes.length) {
             episodes = matchEpisodes;
             titles = matchTitles;
@@ -196,15 +206,11 @@ export async function GET() {
 
     console.log(`返回 ${filteredVideos.length} 个短剧视频`);
 
-    // 保存到内存缓存；空结果不缓存，避免源恢复后仍被 1 小时空缓存顶住
-    if (filteredVideos.length > 0) {
-      cachedRecommends = {
-        timestamp: Date.now(),
-        data: filteredVideos,
-      };
-    } else {
-      cachedRecommends = null;
-    }
+    // 保存到内存缓存
+    cachedRecommends = {
+      timestamp: Date.now(),
+      data: filteredVideos,
+    };
 
     const cacheTime = await getCacheTime();
     return NextResponse.json(
@@ -221,13 +227,113 @@ export async function GET() {
     );
   } catch (error) {
     console.error('获取热播短剧推荐失败:', error);
-    return NextResponse.json(
-      {
-        code: 500,
-        message: '获取热播短剧推荐失败',
-        error: (error as Error).message,
-      },
-      { status: 500 }
-    );
+    // 发生错误时也尝试使用搜索备用方案
+    try {
+      return await searchDuanjuFallback();
+    } catch {
+      return NextResponse.json(
+        {
+          code: 500,
+          message: '获取热播短剧推荐失败',
+          error: (error as Error).message,
+        },
+        { status: 500 }
+      );
+    }
   }
+}
+
+/**
+ * 搜索备用方案：通过搜索关键词获取短剧内容
+ */
+async function searchDuanjuFallback(): Promise<NextResponse> {
+  try {
+    console.log('使用搜索备用方案获取短剧...');
+
+    // 获取所有可用的视频源
+    const allSources = await getAvailableApiSites();
+
+    if (!allSources || allSources.length === 0) {
+      return NextResponse.json({
+        code: 200,
+        message: '暂无视频源',
+        data: [],
+      });
+    }
+
+    // 使用第一个视频源搜索短剧
+    const firstSource = allSources[0];
+    console.log(`使用搜索备用方案，视频源: ${firstSource.name}`);
+
+    // 搜索短剧关键词
+    const searchResult = await searchFromApi(firstSource, '短剧');
+
+    if (!searchResult || searchResult.length === 0) {
+      // 如果搜索"短剧"没结果，尝试搜索其他相关关键词
+      const searchResult2 = await searchFromApi(firstSource, '微短剧');
+      if (!searchResult2 || searchResult2.length === 0) {
+        const searchResult3 = await searchFromApi(firstSource, '短视频');
+        if (!searchResult3 || searchResult3.length === 0) {
+          return NextResponse.json({
+            code: 200,
+            message: '未找到短剧内容',
+            data: [],
+          });
+        }
+        return processSearchResult(searchResult3, firstSource);
+      }
+      return processSearchResult(searchResult2, firstSource);
+    }
+
+    return processSearchResult(searchResult, firstSource);
+  } catch (error) {
+    console.error('搜索备用方案失败:', error);
+    return NextResponse.json({
+      code: 200,
+      message: '获取短剧失败',
+      data: [],
+    });
+  }
+}
+
+/**
+ * 处理搜索结果，转换为短剧格式
+ */
+function processSearchResult(
+  searchResult: SearchResult[],
+  source: any
+): NextResponse {
+  const videos: SearchResult[] = searchResult
+    .filter(
+      (item: SearchResult) => item.episodes && item.episodes.length > 0
+    )
+    .slice(0, 20)
+    .map((item: SearchResult) => ({
+      id: item.id || '',
+      title: item.title || '',
+      poster: item.poster || '',
+      episodes: item.episodes || [],
+      episodes_titles: item.episodes_titles || [],
+      source: source.key,
+      source_name: source.name,
+      class: item.class || '',
+      year: item.year || '',
+      desc: item.desc || '',
+      type_name: item.type_name || '',
+      douban_id: item.douban_id || undefined,
+    }));
+
+  console.log(`搜索备用方案返回 ${videos.length} 个短剧视频`);
+
+  // 保存到内存缓存
+  cachedRecommends = {
+    timestamp: Date.now(),
+    data: videos,
+  };
+
+  return NextResponse.json({
+    code: 200,
+    message: '获取成功',
+    data: videos,
+  });
 }

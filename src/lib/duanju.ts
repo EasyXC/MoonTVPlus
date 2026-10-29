@@ -2,6 +2,10 @@
 
 import { API_CONFIG, getAvailableApiSites } from '@/lib/config';
 import { db } from '@/lib/db';
+import { parseJsonLosslessIntegers } from '@/lib/json';
+import { isDuanjuTypeName } from '@/lib/duanju.client';
+
+export { isDuanjuTypeName };
 
 interface CmsClassResponse {
   class?: Array<{
@@ -18,149 +22,132 @@ export interface DuanjuSource {
   typeName?: string;
 }
 
-export function isDuanjuTypeName(typeName: string): boolean {
-  const normalizedTypeName = typeName.toLowerCase();
-  return (
-    normalizedTypeName.includes('短剧') ||
-    normalizedTypeName.includes('短视频') ||
-    normalizedTypeName.includes('微短剧')
-  );
-}
+// 缓存过期时间：2 小时（毫秒）
+const DUANJU_CACHE_TTL = 2 * 60 * 60 * 1000;
 
-// 短剧视频源缓存有效期：6 小时
-const DUANJU_SOURCES_CACHE_DURATION = 6 * 60 * 60 * 1000;
-
-// 兼容新旧两种缓存格式：新格式为 { ts, sources }，旧格式为纯数组
-function parseDuanjuSourcesCache(
-  cachedData: string | null
-): { sources: DuanjuSource[]; ts: number } | null {
-  if (cachedData === null) return null;
-  try {
-    const parsed = JSON.parse(cachedData);
-    if (Array.isArray(parsed)) {
-      // 旧版本纯数组缓存：无法确定写入时间，视为无效缓存，强制重建
-      return null;
-    }
-    if (
-      parsed &&
-      typeof parsed === 'object' &&
-      typeof parsed.ts === 'number' &&
-      Array.isArray(parsed.sources)
-    ) {
-      return parsed as { sources: DuanjuSource[]; ts: number };
-    }
-    return null;
-  } catch {
-    // 缓存损坏时视为无效，走重新筛选
-    return null;
-  }
+interface DuanjuCacheData {
+  sources: DuanjuSource[];
+  timestamp: number;
 }
 
 /**
  * 获取包含短剧分类的视频源列表
+ * 缓存 2 小时后自动过期，避免空结果被永久缓存；
+ * 兼容旧格式（直接是数组）的缓存，缺少分类信息时自动重建。
  */
 export async function getDuanjuSources(): Promise<DuanjuSource[]> {
   try {
     // 先查询数据库中是否有缓存
     const cachedData = await db.getGlobalValue('duanju');
-    const cache = parseDuanjuSourcesCache(cachedData);
 
-    if (cache !== null) {
-      const cachedSources = cache.sources;
-      const isExpired = Date.now() - cache.ts > DUANJU_SOURCES_CACHE_DURATION;
-      // 旧版本缓存只保存采集源，不包含短剧分类 ID。缺少 typeId 时自动重建缓存。
-      // 空数组缓存仅在有效期内直接返回，超时后重新筛选，避免"空缓存永久锁死"。
-      if (
-        !isExpired &&
-        (cachedSources.length === 0 ||
-          cachedSources.every((source) => source.typeId))
-      ) {
-        return cachedSources;
+    if (cachedData !== null) {
+      let cachedSources: DuanjuSource[] | null = null;
+      let cacheTime: number | undefined;
+
+      try {
+        const parsed = JSON.parse(cachedData);
+        if (Array.isArray(parsed)) {
+          // 旧格式：直接是数组，视为已过期（无时间戳）
+          cachedSources = parsed as DuanjuSource[];
+        } else if (parsed && Array.isArray(parsed.sources)) {
+          cachedSources = parsed.sources as DuanjuSource[];
+          cacheTime = parsed.timestamp as number | undefined;
+        }
+      } catch {
+        // 解析失败，视为无缓存
+        cachedSources = null;
       }
 
-      console.log('短剧视频源缓存过期或缺少分类信息，重新筛选...');
+      if (cachedSources !== null) {
+        const isFresh =
+          typeof cacheTime === 'number' &&
+          Date.now() - cacheTime < DUANJU_CACHE_TTL;
+        // 旧版本缓存只保存采集源，不包含短剧分类 ID。缺少 typeId 时自动重建缓存。
+        const hasTypeInfo =
+          cachedSources.length === 0 ||
+          cachedSources.every((source) => source.typeId);
+
+        if (isFresh && hasTypeInfo) {
+          return cachedSources;
+        }
+
+        if (!isFresh) {
+          console.log('短剧源缓存已过期，重新查询...');
+        } else {
+          console.log('短剧视频源缓存缺少分类信息，重新筛选...');
+        }
+      }
     }
 
-    // 没有缓存，开始筛选
+    // 没有缓存或缓存过期，开始筛选
     console.log('开始筛选包含短剧分类的视频源...');
     const allSources = await getAvailableApiSites();
     const duanjuSources: DuanjuSource[] = [];
 
-    // Cloudflare Workers 单请求最多 50 个子请求（含 Upstash Redis 等内部请求），
-    // 这里限制：① 最多检查前 20 个源，② 每批最多并发 5 个，③ 找到 3 个含短剧源即停止
-    const MAX_CHECK_SOURCES = 20;
-    const MAX_CONCURRENT = 5;
-    const MAX_FOUND = 3;
+    // 并发请求所有视频源的分类列表
+    const checkPromises = allSources.map(async (source) => {
+      try {
+        const classUrl = `${source.api}?ac=list`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    const sourcesToCheck = allSources.slice(0, MAX_CHECK_SOURCES);
+        const response = await fetch(classUrl, {
+          headers: API_CONFIG.search.headers,
+          signal: controller.signal,
+        });
 
-    for (let i = 0; i < sourcesToCheck.length; i += MAX_CONCURRENT) {
-      const batch = sourcesToCheck.slice(i, i + MAX_CONCURRENT);
-      const checkPromises = batch.map(async (source) => {
-        try {
-          const classUrl = `${source.api}?ac=list`;
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 5000);
+        clearTimeout(timeoutId);
 
-          const response = await fetch(classUrl, {
-            headers: API_CONFIG.search.headers,
-            signal: controller.signal,
-          });
-
-          clearTimeout(timeoutId);
-
-          if (!response.ok) {
-            return null;
-          }
-
-          const data: CmsClassResponse = await response.json();
-
-          // 检查是否有短剧分类
-          if (data.class && Array.isArray(data.class)) {
-            const duanjuType = data.class.find((item) =>
-              isDuanjuTypeName(item.type_name || '')
-            );
-
-            if (duanjuType) {
-              return {
-                key: source.key,
-                name: source.name,
-                api: source.api,
-                typeId: duanjuType.type_id.toString(),
-                typeName: duanjuType.type_name,
-              };
-            }
-          }
-
-          return null;
-        } catch (error) {
-          // 请求失败或超时，忽略该源
-          console.error(`检查视频源 ${source.name} 失败:`, error);
+        if (!response.ok) {
           return null;
         }
-      });
 
-      const results = await Promise.all(checkPromises);
-      results.forEach((result) => {
-        if (result) {
-          duanjuSources.push(result);
+        const data = parseJsonLosslessIntegers<CmsClassResponse>(
+          await response.text()
+        );
+
+        // 检查是否有短剧分类
+        if (data.class && Array.isArray(data.class)) {
+          const duanjuType = data.class.find((item) =>
+            isDuanjuTypeName(item.type_name || '')
+          );
+
+          if (duanjuType) {
+            return {
+              key: source.key,
+              name: source.name,
+              api: source.api,
+              typeId: duanjuType.type_id.toString(),
+              typeName: duanjuType.type_name,
+            };
+          }
         }
-      });
 
-      // 找到足够数量后提前退出，减少子请求消耗
-      if (duanjuSources.length >= MAX_FOUND) {
-        console.log(`已找到 ${duanjuSources.length} 个短剧源，提前停止筛选`);
-        break;
+        return null;
+      } catch (error) {
+        // 请求失败或超时，忽略该源
+        console.error(`检查视频源 ${source.name} 失败:`, error);
+        return null;
       }
-    }
+    });
+
+    const results = await Promise.all(checkPromises);
+
+    // 过滤掉null值
+    results.forEach((result) => {
+      if (result) {
+        duanjuSources.push(result);
+      }
+    });
 
     console.log(`找到 ${duanjuSources.length} 个包含短剧分类的视频源`);
 
-    // 存入数据库（带时间戳；即使空数组也存，超时后会自动重建，避免空缓存永久锁死）
-    await db.setGlobalValue(
-      'duanju',
-      JSON.stringify({ ts: Date.now(), sources: duanjuSources })
-    );
+    // 存入数据库，带时间戳（空数组也会存，但会按 TTL 过期后重查）
+    const cacheData: DuanjuCacheData = {
+      sources: duanjuSources,
+      timestamp: Date.now(),
+    };
+    await db.setGlobalValue('duanju', JSON.stringify(cacheData));
 
     return duanjuSources;
   } catch (error) {
