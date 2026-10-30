@@ -79,8 +79,8 @@ export async function GET() {
       );
     }
 
-    // 获取短剧视频源列表
-    const sources = await getDuanjuSources();
+    // 获取短剧视频源列表（分批探测可能未完成，先返回的部分结果足够取第一个源）
+    const { sources } = await getDuanjuSources();
 
     // 如果没有找到短剧视频源，尝试使用搜索备用方案
     if (!sources || sources.length === 0) {

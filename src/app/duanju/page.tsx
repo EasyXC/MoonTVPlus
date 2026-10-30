@@ -192,19 +192,30 @@ function DuanjuPageClient() {
     const fetchSources = async () => {
       setIsLoadingSources(true);
       try {
-        const response = await fetch('/api/duanju/sources');
-        const data = await response.json();
-        if (data.code === 200 && Array.isArray(data.data)) {
-          const list = data.data as DuanjuSource[];
-          setSources(list);
-          // 默认选择第一个源（恢复的源仍可用时保持不变）
-          if (list.length > 0) {
-            setSelectedSource((prev) =>
-              prev && list.some((source) => source.key === prev)
-                ? prev
-                : list[0].key
-            );
+        // 服务端分批探测源（Cloudflare Workers 子请求限制），
+        // done=false 时轮询直至探测完成
+        const MAX_ATTEMPTS = 10;
+        let list: DuanjuSource[] = [];
+        for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+          const response = await fetch('/api/duanju/sources');
+          const data = await response.json();
+          if (data.code === 200 && Array.isArray(data.data)) {
+            list = data.data as DuanjuSource[];
+            setSources(list);
+            // 默认选择第一个源（恢复的源仍可用时保持不变）
+            if (list.length > 0) {
+              setSelectedSource((prev) =>
+                prev && list.some((source) => source.key === prev)
+                  ? prev
+                  : list[0].key
+              );
+            }
+            // 旧版接口无 done 字段，视为已完成
+            if (data.done !== false) break;
+          } else {
+            break;
           }
+          await new Promise((resolve) => setTimeout(resolve, 600));
         }
       } catch (error) {
         console.error('Failed to load duanju sources:', error);

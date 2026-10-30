@@ -12,7 +12,7 @@ export const runtime = 'nodejs';
  */
 export async function GET() {
   try {
-    const sources = await getDuanjuSources();
+    const { sources, done } = await getDuanjuSources();
     const cacheTime = await getCacheTime();
 
     return NextResponse.json(
@@ -20,6 +20,9 @@ export async function GET() {
         code: 200,
         message: '获取成功',
         data: sources,
+        // done=false 表示分批探测尚未完成（Cloudflare Workers 子请求限制），
+        // 前端应稍后重试直至 done=true
+        done,
       },
       {
         headers: {

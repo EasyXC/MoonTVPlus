@@ -29,7 +29,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const sources = await getDuanjuSources();
+    const { sources } = await getDuanjuSources();
     const targetSource = sources.find((source) => source.key === sourceKey);
 
     if (!targetSource) {
